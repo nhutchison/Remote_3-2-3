@@ -53,11 +53,9 @@
  * Add a STOP command, so that if the safety is toggled, the sequence stops immediately - DONE
  * Convert ShowTime to be a timer, instead of a counter.  Just use the counter directly. - TBD
  * Check for over amperage?? - TBD
+ * Update the LegHappy/TiltHappy to be true when good, false when not.  Currenty it's inverted.
  * 
  */
-
-
-
 
 #include "Wire.h"
 #include <USBSabertooth.h>
@@ -112,9 +110,9 @@ Stream* serialPort;
 // memory for command string processing
 char cmdString[CMD_MAX_LENGTH];
 
-
-// ======================================================================Timings===================                          
-//const int LoopTime = 1000;
+/////
+// Timing Varaibles                   
+/////
 const int ReadInterval= 101;
 const int DisplayInterval = 5000;
 const int StanceInterval = 100;
@@ -140,14 +138,16 @@ unsigned long Aux2noPulseCount = 0;  // Count to make sure we have good radio co
 #define TiltDnPin 7   //Limit switch input pin, Grounded when closed
 #define LegUpPin  8   //Limit switch input pin, Grounded when closed
 #define LegDnPin  9   //Limit switch input pin, Grounded when closed
-
-#define ROLLING_CODE_BUTTON_A_PIN 4
-#define ROLLING_CODE_BUTTON_B_PIN 5
+#define ROLLING_CODE_BUTTON_A_PIN 4 // Used as a killswitch / activate button
+#define ROLLING_CODE_BUTTON_B_PIN 5 // Transition between 2 and 3 legs.
 #define ROLLING_CODE_BUTTON_C_PIN 18
 #define ROLLING_CODE_BUTTON_D_PIN 19
 
-const int ThrNumReadings = 4;         //these 5 lines are smoothing for the RC inputs
-int ThrReadings[ThrNumReadings];      // the readings from the analog input
+/////
+// Variables to check R2 state for transitions
+/////
+const int ThrNumReadings = 4;      //these 5 lines are smoothing for the RC inputs
+int ThrReadings[ThrNumReadings];    // the readings from the analog input
 int ThrReadIndex = 0;              // the index of the current reading
 int ThrTotal = 0;                  // the running total
 int ThrAverage = 0;                // the average
@@ -166,26 +166,30 @@ int rollCodeA;
 int rollCodeB;
 int rollCodeC;
 int rollCodeD;
+bool enableRollCodeTransitions = false;
+unsigned long rollCodeTransitionTimeout; // Used to auto disable the enable signal after a set time
 bool enableCommandTransitions = false; // Used to enable transitions via Serial/i2c commands.
 unsigned long commandTransitionTimeout; // Used to auto disable the enable signal after a set time
 #define COMMAND_ENABLE_TIMEOUT 30000 // Default timeout of 30 seconds for performing a transition.
 bool killDebugSent = false;
 
+/////
 // Let's define some human friendly names for the various stances.
+/////
 #define TWO_LEG_STANCE 1
 #define THREE_LEG_STANCE 2
 
 
 /////
-// DEBUG
+// DEBUG Control
 /////
 #define DEBUG
+#define DEBUG_VERBOSE  // Enable this to see all debug status on the Serial Monitor.
 
-// Enable this to see all debug status on the Serial Monitor.
-#define DEBUG_VERBOSE
-
-// Setup Debug stuff
+/////
+// Setup Debug Print stuff
 // This gives me a nice way to enable/disable debug outputs.
+/////
 #ifdef DEBUG
     #define DEBUG_PRINT_LN(msg)  serialPort->println(msg)
     #define DEBUG_PRINT(msg)  serialPort->print(msg)
@@ -207,24 +211,25 @@ bool killDebugSent = false;
 void setup(){
 
 #ifdef ENABLE_RC_TRIGGER
-  pinMode(Aux1Pin, INPUT);
-  pinMode(Aux2Pin, INPUT);
+  pinMode(Aux1Pin, INPUT);  // Set the pin type for the Enable/Disable switch
+  pinMode(Aux2Pin, INPUT);  // Set the pin type for the transition joystick input.
 #endif //ENABLE_RC_TRIGGER
 
-  pinMode(TiltUpPin, INPUT_PULLUP);
-  pinMode(TiltDnPin, INPUT_PULLUP);
-  pinMode(LegUpPin,  INPUT_PULLUP);
-  pinMode(LegDnPin,  INPUT_PULLUP);  
+  pinMode(TiltUpPin, INPUT_PULLUP);  // Limit Switch for body tilt (upper)
+  pinMode(TiltDnPin, INPUT_PULLUP);  // Limit Switch for body tilt (lower)
+  pinMode(LegUpPin,  INPUT_PULLUP);  // Limit Switch for leg lift (upper)
+  pinMode(LegDnPin,  INPUT_PULLUP);  // Limit Switch for leg lift (lower)
 
 #ifdef ENABLE_ROLLING_CODE_TRIGGER
   // Rolling Code Remote Pins
-  pinMode(ROLLING_CODE_BUTTON_A_PIN, INPUT_PULLUP);
-  pinMode(ROLLING_CODE_BUTTON_B_PIN, INPUT_PULLUP);
+  pinMode(ROLLING_CODE_BUTTON_A_PIN, INPUT_PULLUP);  // Rolling code enable/disable pin
+  pinMode(ROLLING_CODE_BUTTON_B_PIN, INPUT_PULLUP);  // Pins to trigger transitions.
   pinMode(ROLLING_CODE_BUTTON_C_PIN, INPUT_PULLUP);
   pinMode(ROLLING_CODE_BUTTON_D_PIN, INPUT_PULLUP); 
 #endif //ENABLE_ROLLING_CODE_TRIGGER
 
   SabertoothTXPinSerial.begin(9600); // 9600 is the default baud rate for Sabertooth Packet Serial.
+                                     // The Sabertooth library uses the Serial TX pin to send data to the motor controller
   
   // Setup the USB Serial Port.
   Serial.begin(9600); // This is the USB Port on a Pro Micro.
@@ -242,10 +247,11 @@ void setup(){
  * If ENABLE_RC_TRIGGER is defined, we will look for RC Inputs to enable transitions
  * If ENABLE_RC_TRIGGER is not defined, we will never set any valid transition states in this code.
  * 
- ************* WARNING ****************
+ ***************************************** WARNING ****************************************
  * If there is no radio signal, or signal is lost, this could cause a faceplant.
  * The Timeout to get a pule is 1 second.  Since we check 2 pins for a pulse, we could
  * spend 2 seconds in this routine if there is no signal.
+ ***************************************** WARNING ****************************************
  * 
  */
 void ReadRC() {
@@ -331,8 +337,6 @@ void ReadLimitSwitches() {
 void ReadRollingCodeTrigger() {
 #ifdef ENABLE_ROLLING_CODE_TRIGGER
 
-  bool enable = false;
-
   rollCodeA = digitalRead(ROLLING_CODE_BUTTON_A_PIN); // Used for Killswitch.
   rollCodeB = digitalRead(ROLLING_CODE_BUTTON_B_PIN);
   rollCodeC = digitalRead(ROLLING_CODE_BUTTON_C_PIN);
@@ -341,22 +345,36 @@ void ReadRollingCodeTrigger() {
   // Killswitch pressed.
   if (rollCodeA == HIGH)
   {
-    enable = true;
+    if (!enableRollCodeTransitions){
+      enableRollCodeTransitions = true;
+      killDebugSent = false;
+      rollCodeTransitionTimeout = millis() + COMMAND_ENABLE_TIMEOUT;
+      DEBUG_PRINT_LN("Rolling Code Transmitter Transitions Enabled");
+    }
+    else{
+      enableRollCodeTransitions = false;
+      killDebugSent = false;
+      DEBUG_PRINT_LN("Rolling Code Transmitter Transitions Disabled");
+    }
   }
   // Button pressed.
-  if (rollCodeB == HIGH)
+  if (enableRollCodeTransitions && (rollCodeB == HIGH))
   {
-  
+    // Start the two to three transition.
+    StanceTarget = THREE_LEG_STANCE; // Three Leg Stance
+    DEBUG_PRINT_LN("Moving to Three Leg Stance.");
+    
   }
   // Button pressed.
-  if (rollCodeC == HIGH)
+  if (enableRollCodeTransitions && (rollCodeC == HIGH))
   {
-  
+    StanceTarget = TWO_LEG_STANCE; // Two Leg Stance
+    DEBUG_PRINT_LN("Moving to Two Leg Stance.");
   }
-    // Button pressed.
-  if (rollCodeD == HIGH)
+  // Button pressed.
+  if (enableRollCodeTransitions && (rollCodeD == HIGH))
   {
-  
+    // Does nothing currently... Perhaps a different 2->3 mode?
   }
 #endif
 }
@@ -402,12 +420,18 @@ void Display(){
 #endif // DEBUG_VERBOSE
 }
 
+
 /*
  * Actual movement commands are here,  when we send the command to move leg down, first it checks the leg down limit switch, if it is closed it 
  * stops the motor, sets a flag (happy) and then exits the loop, if it is open the down motor is triggered. 
  * all 4 work the same way
  */
-//--------------------------------------------------------------------Move Leg Down---------------------------
+
+/* 
+ *  MoveLegDn
+ *  
+ *  Moves the Center leg down.
+ */
 void MoveLegDn(){
 
   // Read the Pin to see where the leg is.
@@ -416,7 +440,7 @@ void MoveLegDn(){
   // If the Limit switch is closed, we should stop the motor.
   if(LegDn == LOW){
     ST.motor(1, 0);     // Stop. 
-    LegHappy = false;
+    LegHappy = false;   // Record that we are in a good state.
     return;
   }
 
@@ -427,7 +451,11 @@ void MoveLegDn(){
   }
 } 
 
-//--------------------------------------------------------------------Move Leg Up---------------------------
+/* 
+ *  MoveLegUp
+ *  
+ *  Moves the Center leg up.
+ */
 void MoveLegUp(){
 
   // Read the Pin to see where the leg is.
@@ -436,7 +464,7 @@ void MoveLegUp(){
   // If the Limit switch is closed, we should stop the motor.
   if(LegUp == LOW){
     ST.motor(1, 0);     // Stop. 
-    LegHappy = false;
+    LegHappy = false;   // Record that we are in a good state.
     return;
   }
 
@@ -447,7 +475,11 @@ void MoveLegUp(){
   }
 } 
 
-//--------------------------------------------------------------------Move Tilt down---------------------------
+/* 
+ *  MoveTiltDn
+ *  
+ *  Rotates the body toward 18 degrees for a 3 leg stance.
+ */
 void MoveTiltDn(){
 
   // Read the Pin to see where the body tilt is.
@@ -456,7 +488,7 @@ void MoveTiltDn(){
   // If the Limit switch is closed, we should stop the motor.
   if(TiltDn == 0){
     ST.motor(2, 0);     // Stop. 
-    TiltHappy = false;
+    TiltHappy = false;  // Record that we are in a good state.
     return;
   }
 
@@ -467,7 +499,11 @@ void MoveTiltDn(){
   }
 }
 
-//--------------------------------------------------------------------Move Tilt Up---------------------------
+/* 
+ *  MoveTiltUp
+ *  
+ *  Rotates the body toward 0 degrees for a 2 leg stance.
+ */
 void MoveTiltUp(){
   // Read the Pin to see where the body tilt is.
   TiltUp = digitalRead(TiltUpPin);
@@ -475,7 +511,7 @@ void MoveTiltUp(){
   // If the Limit switch is closed, we should stop the motor.
   if(TiltUp == LOW){
     ST.motor(2, 0);     // Stop. 
-    TiltHappy = false;
+    TiltHappy = false;  // Record that we are in a good state.
     return;
   }
 
@@ -486,15 +522,17 @@ void MoveTiltUp(){
   }
 } 
 
-//----------------------------------------------------------------Two To Three -------------------------------
+
 /*
- * this command to go from two to three, ended up being a combo of tilt down and leg down 
- * with a last second chech each loop on the limit switches
+ * TwoToThree
+ * 
+ * this command to go from two legs to to three, ended up being a combo of tilt down and leg down 
+ * with a last second check each loop on the limit switches.
  * timing worked out great, by the time the tilt down needed a center foot, it was there.
  */
 void TwoToThree(){
 
-  // Read the pin positions to check that they are both down
+  // Read the pin positions to check if they are both down
   // before we start moving anything.
   TiltDn = digitalRead(TiltDnPin);
   LegDn = digitalRead(LegDnPin);
@@ -503,23 +541,21 @@ void TwoToThree(){
 
   // If the leg is already down, then we are done.
   if(LegDn == LOW){
-    ST.motor(1, 0);
-    LegHappy = false;
+    ST.motor(1, 0);    // Stop
+    LegHappy = false;  // Record that we are in a good state.
   }
-
-  // If the leg is not down, move the leg motor at full power.
-  if(LegDn == HIGH){
+  else if(LegDn == HIGH){
+    // If the leg is not down, move the leg motor at full power.
     ST.motor(1, 2047);  // Go forward at full power. 
   }
 
   // If the Body is already tilted, we are done.
   if(TiltDn == LOW){
-    ST.motor(2, 0);
-    TiltHappy = false;
+    ST.motor(2, 0);     // Stop
+    TiltHappy = false;  // Record that we are in a good state.
   }
-
-  // If the body is not tilted, move the tilt motor at full power.
-  if(TiltDn == HIGH){
+  else if(TiltDn == HIGH){
+      // If the body is not tilted, move the tilt motor at full power.
     ST.motor(2, 2047);  // Go forward at full power. 
   }
 }
@@ -544,11 +580,14 @@ void ThreeToTwo(){
 
   // First if the center leg is up, do nothing. 
   if(LegUp == LOW){
-    ST.motor(1, 0);
-    LegHappy = false; 
+    ST.motor(1, 0);    // Stop
+    LegHappy = false;  // Record that we are in a good state.
   }
-  
-  //  If leg up is open AND the timer is in the first 20 steps then lift the center leg at 25 percent speed
+
+  // TODO:  Convert the counters to just use a timer.
+  // If leg up is open AND the timer is in the first 20 steps then lift the center leg at 25 percent speed
+  // The intent here is to move the leg slowly so that it pushes the body up until we have reached the balance 
+  // point for two leg stance.  After that point we can pull the leg up quickly.
   if(LegUp == HIGH &&  ShowTime >= 1 && ShowTime <= 20){
     ST.motor(1, -500); 
   }
@@ -560,19 +599,39 @@ void ThreeToTwo(){
   
   // at the same time, tilt up till the switch is closed
   if(TiltUp == LOW){
-    ST.motor(2, 0);
-    TiltHappy = false; 
+    ST.motor(2, 0);     // Stop
+    TiltHappy = false;  // Record that we are in a good state.
   }
   if(TiltUp == HIGH){
     ST.motor(2, -2047);  // Go backward at full power. 
   }
 }
 
-//--------------------------------------------------------------------Check Stance-----------------------
-// This is simply taking all of the possibilities of the switch positions and giving them a number. 
-//and this loop is only allowerd to run if both my happy flags have been triggered. 
-// at any time, including power up, the droid can run a check and come up with a number as to how he is standing. 
 
+/*
+ * CheckStance
+ * 
+ * This is simply taking all of the possibilities of the switch positions and giving them a number. 
+ * The loop only runs when both happy flags are triggered, meaning that it does not run in the middle of
+ * a transition.
+ * 
+ * At any time, including power up, the droid can run a check and come up with a number as to how he is standing. 
+ * 
+ * The Display code will output the stance number, as well as a code to tell you in a nice human readable format
+ * what is going on within the droid, so you don't need to physically check (or if there's a problem you can check
+ * to see why something is not reading correctly.
+ * 
+ * The codes are
+ * L = Leg
+ * T = Tilt
+ * U = Up
+ * D = Down
+ * ? = Unknown (Neither up nor down)
+ * 
+ * so L?TU means that the Tilt is up (two leg stance) but the Leg position is unknown.
+ * Leg is always reported first, Tilt second.
+ * 
+ */
 void CheckStance(){
   // We only do this if the leg and tilt are NOT happy.
   if(LegHappy == false && TiltHappy == false){
@@ -656,8 +715,13 @@ void checkKillSwitch()
     stopMotors = true;
   }
 
+  if (!enableRollCodeTransitions)
+  {
+    stopMotors = true;
+  }
+
 #ifdef ENABLE_RC_TRIGGER
-  // WARNING.  IF NO READIO IS CONNECTED, THIS WILL DELAY FOR 1 SECOND!
+  // WARNING.  IF NO RADIO IS CONNECTED, THIS WILL DELAY FOR 1 SECOND!
   Aux1 = pulseIn(Aux1Pin, HIGH);  
   // A signal less than 1800 means the switch is off
   if (Aux1 < 1800)
@@ -819,12 +883,21 @@ void loop(){
     CheckStance();
   }
 
-  if (currentMillis >= commandTransitionTimeout) {
+  // Given the order of the checks here, we only check the timeout if the transitions are enabled
+  // This minimises the time taken to do the check most of the time.
+  if (enableCommandTransitions && (currentMillis >= commandTransitionTimeout)) {
     // We have exceeded the time to do a transition start.
     // Auto Disable the safety so we don't accidentally trigger the transition.
     enableCommandTransitions = false;
     //DEBUG_PRINT_LN("Warning: Transition Enable Timeout reached.  Disabling Command Transitions.");
   }
+
+  if (enableRollCodeTransitions && (currentMillis >= rollCodeTransitionTimeout)) {
+    // We have exceeded the time to do a transition start.
+    // Auto Disable the safety so we don't accidentally trigger the transition.
+    enableCommandTransitions = false;
+    //DEBUG_PRINT_LN("Warning: Transition Enable Timeout reached.  Disabling Command Transitions.");
+  } 
   
   Move();
 
@@ -875,11 +948,16 @@ void receiveEvent(int eventCode) {
 
 
 /*
-   SerialEvent occurs whenever a new data comes in the
-  hardware serial RX.  This routine is run between each
-  time loop() runs, so using delay inside loop can delay
-  response.  Multiple bytes of data may be available.
-*/
+ * serialEventRun
+ * 
+ * SerialEvent occurs whenever a new data comes in the
+ * hardware serial RX.  This routine is run between each
+ * time loop() runs, so using delay inside loop can delay
+ * response.  Multiple bytes of data may be available.
+ * 
+ * That's ok ... I never use delay()!
+ * 
+ */
 void serialEventRun(void)
 {
   if (serialPort->available()) serialEvent();
@@ -1045,20 +1123,6 @@ void doPcommand(int address, char* argument)
         killDebugSent = false;
         DEBUG_PRINT_LN("Command Transitions Disabled");
       }
-      /*
-      if (value == 0) {
-        // Disable the transitions.  This is the default mode.
-        enableCommandTransitions = false;
-        DEBUG_PRINT_LN("Disabling Command Transitions");
-      }
-      else if (value == 1) {
-        // Enable the transitions.  This is the safety measure.
-        enableCommandTransitions = true;
-        killDebugSent = false;
-        commandTransitionTimeout = millis() + COMMAND_ENABLE_TIMEOUT;
-        DEBUG_PRINT_LN("Command Transitions Enabled");
-      }
-      */
       break;
     case 2:
       // We don't need a value here.  Just trigger a transition.
