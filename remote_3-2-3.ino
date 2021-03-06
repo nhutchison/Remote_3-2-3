@@ -59,6 +59,7 @@
 
 #include "Wire.h"
 #include <USBSabertooth.h>
+#include <avr/pgmspace.h>
 
 /////
 // Setup the Comms
@@ -168,7 +169,7 @@ int LegUp;
 int LegDn;
 int Stance;
 int StanceTarget;
-char stanceName[12] = "Three Legs.";
+char stanceName[13] = "Three Legs.";
 bool LegHappy;  // False if the leg is unhappy, True if it is happy
 bool TiltHappy; // False if the tilt is unhappy, True if it is happy
 int rollCodeA;
@@ -242,6 +243,47 @@ unsigned long buttonDTimeout;
 #define WHITE 0x7
 #endif
 
+
+//TEMP TEMP TEMP
+
+
+const char* const PROGMEM COMMAND[31] = {
+// PSI Pro Command Set 1
+ // For testing purposes, some timings have been shortened using the | time modifier.  Default times are noted below.
+"PSI PRO\0",         // Command Set Name (max length is 20 characters)
+"22",              // I2C address of PSI Pro (22 is default for PSI Pro front)
+"YES",             // Add carriage return to command (\r) YES/NO
+"0T1",             // CMD 1 - Mode 1  - Default Pattern
+"0T2",             // CMD 2 - Mode 2  - Flash (fast flash) (4 seconds) Use caution around those sensitive to flashing lights.
+"0T3",             // CMD 3 - Mode 3  - Alarm (slow flash) (4 seconds)
+"0T4",             // CMD 4 - Mode 4  - Short Circuit (10 seconds)
+"0T5",             // CMD 5 - Mode 5  - Scream (4 seconds)
+"0T6|10",          // CMD 6 - Mode 6  - Leia Message (10 seconds, default 34 seconds)
+"0T7",             // CMD 7 - Mode 7  - I Heart U (10 seconds)
+"0T8",             // CMD 8 - Mode 8  - Quarter Panel Sweep (7 seconds)
+"0T9",             // CMD 9 - Mode 9  - Flashing Red Heart (Front PSI), Pulse Monitor (Rear PSI)
+"0T10",            // CMD 10 - Mode 10 - Star Wars - Title Scroll (15 seconds)
+"0T11|10",         // CMD 11 - Mode 11 - Imperial March (10 seconds, default 47 seconds)
+"0T12",            // CMD 12 - Mode 12 - Disco Ball (4 seconds)
+"0T13",            // CMD 13 - Mode 13 - Disco Ball - Runs Indefinitely
+"0T14",            // CMD 14 - Mode 14 - Rebel Symbol (5 seconds)
+"0T15|10",         // CMD 15 - Mode 15 - Knight Rider (10 seconds, default 20 seconds)
+"0T16",            // CMD 16 - Mode 16 - Test Sequence (White on Indefinitely)
+"0T17",            // CMD 17 - Mode 17 - Red on Indefinitely
+"0T18",            // CMD 18 - Mode 18 - Green on Indefinitely
+"0T19",            // CMD 19 - Mode 19 - LightSaber Battle
+"0T20",            // CMD 20 - Mode 20 - Star Wars Intro (scrolling yellow "text" getting smaller and dimmer)
+"0T21",            // CMD 21 - Mode 21 - VU Meter (4 seconds)
+"0T92",            // CMD 22 - Mode 92 - VU Meter - Runs Indefinitely (Spectrum on Teeces)
+"0T0",             // CMD 23 - Mode 0  - Turn Panel off (This will also turn stop the Teeces if they share the serial connection and the "0" address is used)
+"3P200",           // CMD 24 - Sets PSI to Max Brightness (200), does not save to EEPROM
+"3P0",             // CMD 25 - Restores PSI Brightness to previous value
+"",                // CMD 26
+"",                // CMD 27
+"",                // CMD 28
+
+};
+
 /*
 void sendCommand(uint8_t addr, char* command){
 
@@ -300,6 +342,9 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print("by Neil H v1.0");
 #endif
+
+  // Setup the Target as no-target to begin.
+  StanceTarget = 0;
 
 }
 
@@ -402,8 +447,20 @@ void ReadRollingCodeTrigger() {
   unsigned long now = millis();
   rollCodeA = digitalRead(ROLLING_CODE_BUTTON_A_PIN); // Used for Killswitch.
   rollCodeB = digitalRead(ROLLING_CODE_BUTTON_B_PIN);
-  rollCodeC = digitalRead(ROLLING_CODE_BUTTON_C_PIN);
+  //rollCodeC = digitalRead(ROLLING_CODE_BUTTON_C_PIN);
   rollCodeD = digitalRead(ROLLING_CODE_BUTTON_D_PIN);
+
+/*
+  DEBUG_PRINT("Button A: ");
+  (rollCodeA == HIGH) ? DEBUG_PRINT_LN("HIGH") : DEBUG_PRINT_LN("LOW");
+  DEBUG_PRINT("Button B: ");
+  (rollCodeB == HIGH) ? DEBUG_PRINT_LN("HIGH") : DEBUG_PRINT_LN("LOW");
+  DEBUG_PRINT("Button C: ");
+  (rollCodeC == HIGH) ? DEBUG_PRINT_LN("HIGH") : DEBUG_PRINT_LN("LOW");
+  DEBUG_PRINT("Button D: ");
+  (rollCodeD == HIGH) ? DEBUG_PRINT_LN("HIGH") : DEBUG_PRINT_LN("LOW");
+  */
+
 
   // Killswitch pressed.
   // Since the high signal lasts for several hundred milliseconds, we need to prevent checking 
@@ -442,17 +499,18 @@ void ReadRollingCodeTrigger() {
       return;
     }
   }
-  
+  /*
   if (now >= buttonCTimeout){
     // Button pressed.
     if (enableRollCodeTransitions && (rollCodeC == HIGH))
     {
       buttonCTimeout = now + BUTTON_DEBOUNCE_TIME;
-      StanceTarget = TWO_LEG_STANCE; // Two Leg Stance
+      //StanceTarget = TWO_LEG_STANCE; // Two Leg Stance
       DEBUG_PRINT_LN("Moving to Two Leg Stance.");
       return;
     }
   }
+  */
   
   if (now >= buttonDTimeout){
     // Button pressed.
@@ -460,7 +518,9 @@ void ReadRollingCodeTrigger() {
     {
       buttonDTimeout = now + BUTTON_DEBOUNCE_TIME;
       // Does nothing currently... Perhaps a different 2->3 mode?
-      DEBUG_PRINT_LN("Button 4 Pressed");
+      //DEBUG_PRINT_LN("Button 4 Pressed");
+      StanceTarget = TWO_LEG_STANCE; // Two Leg Stance
+      DEBUG_PRINT_LN("Moving to Two Leg Stance.");
       return;
     }
   }
@@ -739,7 +799,7 @@ void ThreeToTwo() {
     ST.motor(1, -250);
   }
 
-  //  If leg up is open AND the timer is over 21 steps then lift the center leg at full speed
+  //  If leg up is open AND the timer is over 12 steps then lift the center leg at full speed
   if (LegUp == HIGH && ShowTime >= 12) {
     ST.motor(1, -2047);
   }
@@ -1111,7 +1171,21 @@ void loop() {
     PreviousShowTimeMillis = currentMillis;
     ShowTime++;
     //DEBUG_PRINT("Showtime: ");DEBUG_PRINT_LN(ShowTime);
-  }
+  } 
+
+/*
+  char NEW_SET[30];
+  char c = 0;
+  unsigned int flash_address = pgm_read_word(&COMMAND[0]);
+  do{
+    c = (char) pgm_read_byte(flash_address++);
+    DEBUG_PRINT(c);
+  //  strcat(NEW_SET, c);
+  } while (c!='\0');
+
+  //strcpy_P(NEW_SET, (char *)pgm_read_byte_near(&COMMAND[0]));
+  //DEBUG_PRINT_LN(NEW_SET);
+  */
 }
 
 
